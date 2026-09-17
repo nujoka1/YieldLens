@@ -1,0 +1,50 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Generated data and runtime state (keep directory placeholders)
+data/**
+!data/**/
+!data/**/.gitkeep
+logs/**
+!logs/.gitkeep
+*.parquet
+*.orc
+*.avro
+*.csv
+*.jsonl
+*.log
+
+# Spark / notebooks / IDE / OS
+spark-warehouse/
+metastore_db/
+.ipynb_checkpoints/
+.idea/
+.vscode/
+.DS_Store
+.directory
+
+# Local reports and office lock files
+~$*
+*.pdf
+*.docx
+*.odt
+*.dotx
+*.zip
+*.pem
+*.key

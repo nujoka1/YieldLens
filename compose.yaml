@@ -1,0 +1,264 @@
+name: ${COMPOSE_PROJECT_NAME:-yieldlens}
+
+x-common-env: &common-env
+  YIELDLENS_ENV: ${YIELDLENS_ENV:-development}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+  KAFKA_TOPIC_IOT: ${KAFKA_TOPIC_IOT:-yieldlens.iot.telemetry.v1}
+  KAFKA_TOPIC_CLIMATE: ${KAFKA_TOPIC_CLIMATE:-yieldlens.climate.daily.v1}
+  KAFKA_TOPIC_FAOSTAT: ${KAFKA_TOPIC_FAOSTAT:-yieldlens.faostat.annual.v1}
+  MINIO_ENDPOINT: ${MINIO_ENDPOINT:-minio:9000}
+  MINIO_SECURE: ${MINIO_SECURE:-false}
+  MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-yieldlens_admin}
+  MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?Set local MinIO credentials in .env}
+  MINIO_RAW_BUCKET: ${MINIO_RAW_BUCKET:-yieldlens-raw}
+  MINIO_CURATED_BUCKET: ${MINIO_CURATED_BUCKET:-yieldlens-curated}
+  POSTGRES_DB: ${POSTGRES_DB:-yieldlens}
+  POSTGRES_USER: ${POSTGRES_USER:-yieldlens_app}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set local PostgreSQL credentials in .env}
+  POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+  POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+  SPARK_MASTER_URL: ${SPARK_MASTER_URL:-spark://spark-master:7077}
+
+services:
+  kafka:
+    image: apache/kafka:3.9.1
+    mem_limit: 512m
+    hostname: kafka
+    ports:
+      - "127.0.0.1:29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: -Xms128m -Xmx256m
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: ${KAFKA_TOPIC_PARTITIONS:-6}
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "KAFKA_HEAP_OPTS='-Xms32m -Xmx64m' /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 60s
+      timeout: 45s
+      retries: 5
+      start_period: 20s
+    restart: "no"
+    networks: [yieldlens]
+
+  kafka-init:
+    mem_limit: 256m
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_TOPIC_IOT: ${KAFKA_TOPIC_IOT:-yieldlens.iot.telemetry.v1}
+      KAFKA_TOPIC_CLIMATE: ${KAFKA_TOPIC_CLIMATE:-yieldlens.climate.daily.v1}
+      KAFKA_TOPIC_FAOSTAT: ${KAFKA_TOPIC_FAOSTAT:-yieldlens.faostat.annual.v1}
+      KAFKA_TOPIC_PARTITIONS: ${KAFKA_TOPIC_PARTITIONS:-6}
+      KAFKA_HEAP_OPTS: -Xms32m -Xmx128m
+    command:
+      - /bin/bash
+      - -euc
+      - |
+        for topic in "$${KAFKA_TOPIC_IOT}" "$${KAFKA_TOPIC_CLIMATE}" "$${KAFKA_TOPIC_FAOSTAT}"; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+            --create --if-not-exists --topic "$${topic}" \
+            --partitions "$${KAFKA_TOPIC_PARTITIONS}" --replication-factor 1
+        done
+    restart: "no"
+    networks: [yieldlens]
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    mem_limit: 384m
+    command: server /data --console-address ":9001"
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-19001}:9001"
+    environment:
+      GOMEMLIMIT: 192MiB
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-yieldlens_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set local MinIO credentials in .env}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: "no"
+    networks: [yieldlens]
+
+  minio-init:
+    mem_limit: 256m
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      GOMEMLIMIT: 192MiB
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-yieldlens_admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?Set local MinIO credentials in .env}
+      MINIO_RAW_BUCKET: ${MINIO_RAW_BUCKET:-yieldlens-raw}
+      MINIO_CURATED_BUCKET: ${MINIO_CURATED_BUCKET:-yieldlens-curated}
+    entrypoint:
+      - /bin/sh
+      - -euc
+      - |
+        mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing "local/$${MINIO_RAW_BUCKET}"
+        mc mb --ignore-existing "local/$${MINIO_CURATED_BUCKET}"
+        for zone in bronze silver gold checkpoints; do
+          if ! mc stat "local/$${MINIO_CURATED_BUCKET}/$$zone/.keep" >/dev/null 2>&1; then
+            printf '%s' '{"kind":"zone-marker","synthetic":true}' | mc pipe "local/$${MINIO_CURATED_BUCKET}/$$zone/.keep"
+          fi
+        done
+    restart: "no"
+    networks: [yieldlens]
+
+  spark-master:
+    image: apache/spark:3.5.6
+    mem_limit: 1g
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "127.0.0.1:7077:7077"
+      - "127.0.0.1:8080:8080"
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_DAEMON_MEMORY: 128m
+    volumes:
+      - spark-events:/opt/spark/events
+      - ./src:/opt/yieldlens/src:ro
+      - smoke-data:/tmp/yieldlens-smoke
+      - ./scripts:/opt/yieldlens/scripts:ro
+    depends_on:
+      smoke-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/spark-master/7077'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: "no"
+    networks: [yieldlens]
+
+  spark-worker:
+    image: apache/spark:3.5.6
+    mem_limit: 1g
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8081:8081"
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_DAEMON_MEMORY: 128m
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-1}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-512m}
+    volumes:
+      - spark-worker-data:/opt/spark/work
+      - ./src:/opt/yieldlens/src:ro
+      - smoke-data:/tmp/yieldlens-smoke
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8081'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: "no"
+    networks: [yieldlens]
+
+  postgres:
+    image: postgres:17.6-alpine
+    mem_limit: 192m
+    command: ["postgres", "-c", "shared_buffers=16MB", "-c", "work_mem=1MB", "-c", "max_connections=20"]
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-yieldlens}
+      POSTGRES_USER: ${POSTGRES_USER:-yieldlens_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set local PostgreSQL credentials in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./config/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: "no"
+    networks: [yieldlens]
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/python/Dockerfile
+    init: true
+    mem_limit: 192m
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+    environment:
+      <<: *common-env
+      COVERAGE_FILE: /tmp/.coverage
+    volumes:
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
+      - ./scripts:/app/scripts:ro
+      - ./.env.example:/app/.env.example:ro
+      - ./pyproject.toml:/app/pyproject.toml:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-m", "yieldlens.healthcheck"]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+      start_period: 10s
+    restart: "no"
+    networks: [yieldlens]
+
+  smoke-init:
+    image: apache/spark:3.5.6
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec", "chown 185:0 /tmp/yieldlens-smoke && chmod 770 /tmp/yieldlens-smoke"]
+    volumes:
+      - smoke-data:/tmp/yieldlens-smoke
+    restart: "no"
+    networks: [yieldlens]
+
+networks:
+  yieldlens:
+    driver: bridge
+
+volumes:
+  kafka-data:
+  minio-data:
+  postgres-data:
+  spark-events:
+  spark-worker-data:
+  smoke-data:

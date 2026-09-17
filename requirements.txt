@@ -1,0 +1,5 @@
+kafka-python-ng==2.2.3
+minio==7.2.16
+psycopg[binary]==3.2.13
+pydantic-settings==2.10.1
+structlog==25.4.0
